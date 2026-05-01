@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PCM WebSocket Audio Viewer</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; line-height: 1.4; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    input, button { font-size: 14px; padding: 8px 10px; }
+    input { width: 360px; max-width: 100%; }
+    button { cursor: pointer; }
+    .card { margin-top: 16px; padding: 12px; border: 1px solid #ddd; border-radius: 10px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f1f1f1; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <h2>WebSocket PCM Audio Viewer</h2>
+
+  <div class="row">
+    <label for="wsUrl">WebSocket URL:</label>
+    <input id="wsUrl" value="" />
+    <button id="btnConnect">Connect</button>
+    <button id="btnStart" disabled>Start Audio</button>
+    <button id="btnStop" disabled>Stop</button>
+    <span id="status" class="pill">DISCONNECTED</span>
+  </div>
+
+  <div class="card">
+    <div><b>Header</b></div>
+    <div id="hdr" class="mono">—</div>
+  </div>
+
+  <div class="card">
+    <div><b>Stats</b></div>
+    <div id="stats" class="mono">—</div>
+  </div>
+
+  <!------------- Changing starts here: adding canvas function for web graph -------------->
+  <div class="card">
+    <div><b>Header</b></div>
+    <div id="hdr" class="mono">—</div>
+  </div>
+
+  <div class="card">
+    <div><b>Spectrogram (5s Window)</b></div>
+    <!--by calibrating the "width" we can adjust the time range of spectrogram (ex: 600px for 10s, 300px for 5s)-->
+    <!--<canvas id="spectrogram" width="600" height="256" style="width: 100%; max-width: 600px; height: 256px; background: black; border-radius: 8px; margin-top: 8px;"></canvas>-->
+    <canvas id="spectrogram" width="250" height="256" style="width: 100%; height: 256px; background: black; border-radius: 8px; margin-top: 8px;"></canvas>
+  </div>
+  <div class="card">
+    <div><b>Stats</b></div>
+    <div id="stats" class="mono">—</div>
+  </div>
+  <!-------------- Changing ends here ------------------>
+
+
+  <div class="card">
+    <div><b>Notes</b></div>
+    <ul>
+      <li>Click <b>Start Audio</b> after connecting (browser requires a user gesture).</li>
+      <li>This expects <b>PCM S16LE</b> chunks + JSON header first.</li>
+      <li>If audio is choppy on mobile/Wi-Fi, increasing server <code>chunk_ms</code> (40–60ms) can help.</li>
+      <li>If AudioWorklet is blocked (often on non-secure IP origins), this page falls back to ScriptProcessor.</li>
+    </ul>
+  </div>
+
+<script>
+(() => {
+  // ---- UI ----
+  const elUrl = document.getElementById("wsUrl");
+  const btnConnect = document.getElementById("btnConnect");
+  const btnStart = document.getElementById("btnStart");
+  const btnStop = document.getElementById("btnStop");
+  const elStatus = document.getElementById("status");
+  const elHdr = document.getElementById("hdr");
+  const elStats = document.getElementById("stats");
+
+  // Use the same host that served this page (works on phone/PC)
+  elUrl.value = `ws://${location.hostname}:8765`;
+
+  // ---- WS / Audio state ----
+  let ws = null;
+  let header = null;
+
+  // WebAudio
+  let audioCtx = null;
+  let workletNode = null;
+
+  // *********creating two variables: one for the analyzer and one for the animation ID👇 changing starts here
+  let analyser = null;
+  let drawVisual = null; 
+  // *********👆 changing ends here
+
+  // ScriptProcessor fallback state
+  let spNode = null;
+  let spQueue = [];
+  let spQueueSamples = 0;
+
+  // Stats
+  let bytesRx = 0;
+  let chunksRx = 0;
+  let lastStatT = performance.now();
+  let kbps = 0;
+
+  function setStatus(text) {
+    elStatus.textContent = text;
+  }
+
+  function resetStats() {
+    bytesRx = 0;
+    chunksRx = 0;
+    lastStatT = performance.now();
+    kbps = 0;
+    elStats.textContent = "—";
+  }
+
+  function audioCtxText() {
+    if (!audioCtx) return "not started";
+    return `${audioCtx.sampleRate}Hz, state=${audioCtx.state}`;
+  }
+
+  function safeAppendStats(line) {
+    const cur = elStats.textContent || "";
+    elStats.textContent = cur === "—" ? String(line) : (cur + String(line));
+  }
+
+  // 👇👇👇 This part is how we show the spectrogram!!! changing starts here 👇👇👇
+  function drawSpectrogram() {
+    if (!analyser) return;
+    drawVisual = requestAnimationFrame(drawSpectrogram); // enable while loop
+
+    const canvas = document.getElementById('spectrogram');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    
+    // 1. rolling effect: shifting the existing image 1 pixel to the left
+    ctx.drawImage(canvas, -1, 0);
+
+    // 2. read the current frequency data from dataArray using FFT
+    analyser.getByteFrequencyData(dataArray);
+
+    // 3. here setting a max frequency to show (e.g., 6000 Hz) to focus on the more relevant part of the spectrum for audio analysis, and also to make it visually clearer. The rest will be ignored in the display.
+    //Theoratically max frequency is 24000 Hz (Nyquist frequency), but we might not need to show that high frequency.
+    const maxFreqToShow = 6000; 
+    
+    // counting the nyquist frequency
+    const nyquist = audioCtx.sampleRate / 2; // theoratically 24000 Hz for 48kHz sample rate
+    const maxBinIndex = Math.floor((maxFreqToShow / nyquist) * bufferLength);
+
+    const x = canvas.width - 1;
+    // make the assigned range of frequency fit the graph height
+    const h = canvas.height / maxBinIndex; 
+
+    // show max frequency as the frequency we designed (maxBinIndex), not the bufferLength
+    for (let i = 0; i < maxBinIndex; i++) {
+        const val = dataArray[i];
+        if (val === 0) {
+            ctx.fillStyle = 'black';
+        } else {
+            const hue = (1 - (val / 255)) * 240;
+            ctx.fillStyle = `hsl(${hue}, 100%, 50%)`;
+        }
+        
+        const y = canvas.height - (i * h) - h;
+        ctx.fillRect(x, y, 1, h);
+    }
+  }
+  // 👆👆👆 This part is how we show the spectrogram!!! changing ends here 👆👆👆
+
+  // ---- PCM decode helpers ----
+  // Convert Int16 PCM (little-endian) to Float32 [-1, 1]
+  function s16leToFloat32(arrayBuffer) {
+    const view = new DataView(arrayBuffer);
+    const n = arrayBuffer.byteLength / 2;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const s = view.getInt16(i * 2, true);
+      out[i] = Math.max(-1, Math.min(1, s / 32768));
+    }
+    return out;
+  }
+
+  // ---- AudioWorklet: simple jitter buffer ----
+  const workletCode = `
+    class PCMPlayerProcessor extends AudioWorkletProcessor {
+      constructor(options) {
+        super();
+        this.buffer = new Float32Array(0);
+        this.readIdx = 0;
+
+        this.sampleRateIn = (options.processorOptions && options.processorOptions.sampleRateIn) || sampleRate;
+        this.channels = (options.processorOptions && options.processorOptions.channels) || 1;
+
+        this.underruns = 0;
+
+        this.port.onmessage = (ev) => {
+          const chunk = ev.data; // Float32Array
+          if (!(chunk && chunk.length)) return;
+
+          const unread = this.buffer.subarray(this.readIdx);
+          const newBuf = new Float32Array(unread.length + chunk.length);
+          newBuf.set(unread, 0);
+          newBuf.set(chunk, unread.length);
+          this.buffer = newBuf;
+          this.readIdx = 0;
+        };
+      }
+
+      process(inputs, outputs) {
+        const out = outputs[0];
+        const ch0 = out[0];
+        const frames = ch0.length;
+
+        const available = this.buffer.length - this.readIdx;
+
+        if (available >= frames) {
+          ch0.set(this.buffer.subarray(this.readIdx, this.readIdx + frames));
+          this.readIdx += frames;
+        } else {
+          ch0.fill(0);
+          this.underruns++;
+          if (this.underruns % 50 === 0) {
+            this.port.postMessage({ type: "underrun", count: this.underruns });
+          }
+        }
+
+        if (out.length > 1) {
+          for (let c = 1; c < out.length; c++) out[c].set(ch0);
+        }
+
+        return true;
+      }
+    }
+
+    registerProcessor("pcm-player", PCMPlayerProcessor);
+  `;
+
+  function initScriptProcessorFallback() {
+    // ScriptProcessorNode is deprecated, but it works broadly on mobile and non-secure origins.
+    const bufSize = 2048;
+
+    spQueue = [];
+    spQueueSamples = 0;
+
+    spNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
+    spNode.onaudioprocess = (ev) => {
+      const out = ev.outputBuffer.getChannelData(0);
+      let offset = 0;
+
+      while (offset < out.length) {
+        if (spQueue.length === 0) {
+          out.fill(0, offset);
+          return;
+        }
+
+        const cur = spQueue[0];
+        const take = Math.min(cur.length, out.length - offset);
+        out.set(cur.subarray(0, take), offset);
+
+        if (take === cur.length) {
+          spQueue.shift();
+        } else {
+          spQueue[0] = cur.subarray(take);
+        }
+
+        spQueueSamples -= take;
+        offset += take;
+      }
+    };
+
+// we add an analyzer node between the microphone and the output so that we can extract acoustic data. changing starts here 👇
+    spNode.connect(analyser); // 👈 originally is "audioCtx.destination", we change to "analyser"
+// changing ends here 👆
+
+    safeAppendStats(`[Audio] using ScriptProcessor fallback.\n`);
+  }
+
+  async function initAudio(headerObj) {
+    const sr = headerObj.rate || 48000;
+
+    elStats.textContent =
+      `[Audio] init start\n` +
+      `isSecureContext=${window.isSecureContext}\n` +
+      `origin=${location.origin}\n` +
+      `AudioWorkletNode=${!!window.AudioWorkletNode}\n`;
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+    
+    // 👇 basic setup of the analyzer, it is connecting to the speaker(output). changing starts here 👇
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0.2;
+    analyser.connect(audioCtx.destination);
+    // changing ends here👆
+
+
+    safeAppendStats(`[Audio] AudioContext created: sr=${audioCtx.sampleRate}, state=${audioCtx.state}\n`);
+
+    // Prefer AudioWorklet when possible, but fall back gracefully
+    const canWorklet = !!(audioCtx.audioWorklet && window.AudioWorkletNode && window.isSecureContext);
+
+    if (!canWorklet) {
+      safeAppendStats(`[Audio] AudioWorklet not available (or not secure). Using ScriptProcessor fallback.\n`);
+      initScriptProcessorFallback();
+      return;
+    }
+
+    const blob = new Blob([workletCode], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+
+    safeAppendStats(`[Audio] addModule...\n`);
+    try {
+      await audioCtx.audioWorklet.addModule(url);
+    } catch (e) {
+      safeAppendStats(`[Audio] addModule failed:\n${String(e)}\n`);
+      safeAppendStats(`[Audio] Falling back to ScriptProcessor.\n`);
+      URL.revokeObjectURL(url);
+      initScriptProcessorFallback();
+      return;
+    }
+    URL.revokeObjectURL(url);
+
+    safeAppendStats(`[Audio] creating AudioWorkletNode...\n`);
+    workletNode = new AudioWorkletNode(audioCtx, "pcm-player", {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      processorOptions: {
+        sampleRateIn: sr,
+        channels: headerObj.channels || 1
+      }
+    });
+
+//changing starts here 👇
+    workletNode.connect(analyser); // 👈 原本是 audioCtx.destination，改成 analyser
+// changing ends here 👆
+
+    safeAppendStats(`[Audio] using AudioWorklet.\n`);
+  }
+
+  function pushAudioChunk(arrayBuffer) {
+    const f32 = s16leToFloat32(arrayBuffer);
+
+    if (workletNode) {
+      workletNode.port.postMessage(f32, [f32.buffer]);
+      return;
+    }
+
+    if (spNode) {
+      spQueue.push(f32);
+      spQueueSamples += f32.length;
+
+      // Drop old data to avoid growing latency if the consumer falls behind.
+      const maxBufferedSamples = (audioCtx.sampleRate * 1.5) | 0; // ~1.5 seconds
+      while (spQueueSamples > maxBufferedSamples && spQueue.length > 1) {
+        spQueueSamples -= spQueue[0].length;
+        spQueue.shift();
+      }
+    }
+  }
+
+  // ---- WebSocket connect ----
+  function connectWs() {
+    const url = elUrl.value.trim();
+    if (!url) return;
+
+    resetStats();
+    header = null;
+    elHdr.textContent = "—";
+
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+
+    setStatus("CONNECTING");
+
+    ws.onopen = () => {
+      setStatus("CONNECTED");
+      // Enable Start only after header is received.
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+    };
+
+    ws.onclose = () => {
+      setStatus("DISCONNECTED");
+      btnStart.disabled = true;
+      btnStop.disabled = true;
+      ws = null;
+    };
+
+    ws.onerror = (e) => {
+      setStatus("ERROR");
+      console.error(e);
+    };
+
+    ws.onmessage = async (msg) => {
+      // First message is JSON header
+      if (typeof msg.data === "string") {
+        try {
+          header = JSON.parse(msg.data);
+          elHdr.textContent = JSON.stringify(header, null, 2);
+          btnStart.disabled = false;
+        } catch (e) {
+          console.error("Header parse error:", e);
+        }
+        return;
+      }
+
+      if (!header) return;
+
+      const ab = msg.data; // ArrayBuffer
+      bytesRx += ab.byteLength;
+      chunksRx += 1;
+
+      const now = performance.now();
+      const dt = (now - lastStatT) / 1000;
+      if (dt >= 1.0) {
+        kbps = (bytesRx / 1024) / dt;
+        elStats.textContent =
+          `chunks/s ~ ${(chunksRx / dt).toFixed(1)}\n` +
+          `KB/s     ~ ${kbps.toFixed(1)}\n` +
+          `bytes    = ${bytesRx}\n` +
+          `chunks   = ${chunksRx}\n` +
+          `audioCtx = ${audioCtxText()}\n` +
+          `secure   = ${window.isSecureContext}\n` +
+          `mode     = ${workletNode ? "worklet" : (spNode ? "scriptprocessor" : "none")}\n`;
+        bytesRx = 0;
+        chunksRx = 0;
+        lastStatT = now;
+      }
+
+      if (audioCtx) {
+        pushAudioChunk(ab);
+      }
+    };
+  }
+
+  function disconnectWs() {
+    if (ws) {
+      ws.close();
+      ws = null;
+    }
+    setStatus("DISCONNECTED");
+    btnStart.disabled = true;
+    btnStop.disabled = true;
+  }
+
+  // ---- Buttons ----
+  btnConnect.onclick = () => {
+    if (ws) {
+      disconnectWs();
+      btnConnect.textContent = "Connect";
+    } else {
+      connectWs();
+      btnConnect.textContent = "Disconnect";
+    }
+  };
+
+  btnStart.onclick = async () => {
+    elStats.textContent = "[UI] Start Audio clicked.\n";
+
+    if (!ws) {
+      safeAppendStats("[UI] No WebSocket.\n");
+      alert("Connect WebSocket first.");
+      return;
+    }
+    if (!header) {
+      safeAppendStats("[UI] Header not received yet.\n");
+      alert("Waiting for header... try again in a second.");
+      return;
+    }
+
+    try {
+      if (!audioCtx) {
+        await initAudio(header);
+      }
+
+      safeAppendStats(`[Audio] state(before resume)=${audioCtx.state}\n`);
+      if (audioCtx.state !== "running") {
+        await audioCtx.resume();
+      }
+      safeAppendStats(`[Audio] state(after resume)=${audioCtx.state}\n`);
+
+      btnStart.disabled = true;
+      console.log("Audio started.");
+
+      //changing starts here 👇
+      drawSpectrogram(); // 👈 enable spectrogram drawing
+      // changing ends here 👆
+
+    } catch (e) {
+      safeAppendStats(`[ERR] Start Audio failed:\n${String(e)}\n`);
+      console.error(e);
+      alert("Audio init failed. Check Stats.");
+    }
+  };
+
+  btnStop.onclick = async () => {
+
+    //changing starts here 👇
+    cancelAnimationFrame(drawVisual); // 👈 disable spectrogram drawing
+    //changing ends here 👆
+
+    if (workletNode) {
+      workletNode.disconnect();
+      workletNode = null;
+    }
+    if (spNode) {
+      spNode.disconnect();
+      spNode.onaudioprocess = null;
+      spNode = null;
+    }
+    spQueue = [];
+    spQueueSamples = 0;
+
+    if (audioCtx) {
+      await audioCtx.close();
+      audioCtx = null;
+    }
+
+    btnStart.disabled = !ws ? true : (header ? false : true);
+    console.log("Audio stopped.");
+  };
+
+  window.addEventListener("beforeunload", () => {
+    try { disconnectWs(); } catch {}
+  });
+})();
+</script>
+</body>
+</html>
